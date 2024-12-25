@@ -1,6 +1,10 @@
 from random import randint
 from threading import Thread
 from time import sleep
+from configparser import ConfigParser
+
+cfg = ConfigParser()
+cfg.read("cfg.ini")
 
 class Request:
     def __init__(self, family):
