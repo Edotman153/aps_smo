@@ -525,13 +525,13 @@ int main() {
 	auto end = std::chrono::system_clock::now();
 	auto allTime = (std::chrono::duration_cast<std::chrono::milliseconds>(end - start)).count();
 	std::ofstream out;
-	out.open("banks.txt");
+	out.open("C:\\trash\\aps\\aps_smo\\banks.txt");
 	for (size_t i = 0; i < numBanks; i++)
 	{
-		out << "Bank " << i << ' ' << 1 - (double(beg[i].getAvailableTime()) / allTime) << '\n';
+		out << "Bank " << i << ' ' << 1 - (float(beg[i].getAvailableTime()) / allTime) << '\n';
 	}
 	out.close();
-	out.open("familys.txt");
+	out.open("C:\\trash\\aps\\aps_smo\\familys.txt");
 	for (size_t i = 0; i < numFamilys; i++) {
 		out << "USER " << i << " statistic: ALL: " << stats[i].allRequests << " success: "
 			<< stats[i].proceededRequests<< " declined: " << stats[i].rejectedRequests << '\n';
