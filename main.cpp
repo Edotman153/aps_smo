@@ -11,9 +11,9 @@
 #include <algorithm>
 #include <map>
 #undef min
-constexpr size_t numFamilys = 15;
-constexpr size_t bufSize = 30;
-constexpr size_t numBanks = 10;
+constexpr size_t numFamilys = 5;
+constexpr size_t bufSize = 10;
+constexpr size_t numBanks = 7;
 std::mutex coutMutex{};
 struct stat_t
 {
@@ -54,13 +54,14 @@ class RequestAcceptanceSystem;
 class Family
 {
 public:
-	Family(size_t prio, RequestAcceptanceSystem* rp) :
-		r(rp),
-		priority(prio),
+	Family() :
+		r(nullptr),
+		priority(0),
 		id(0)
 	{
 		mutex.lock();
 		id = familyid;
+		priority = id;
 		++familyid;
 		mutex.unlock();
 		statsMutex.lock();
@@ -70,8 +71,9 @@ public:
 	void generateAndSendRequest();
 	size_t getPriority() const { return priority; }
 	size_t getid() const { return id; }
+	void setPtr(RequestAcceptanceSystem* acc) const { r = acc; }
 private:
-	RequestAcceptanceSystem* r;
+	mutable RequestAcceptanceSystem* r;
 	size_t priority;
 	size_t id;
 	static size_t familyid;
@@ -440,7 +442,7 @@ void Bank::run()
 {
 	std::random_device rd;
 	std::mt19937 gen(rd());
-	std::exponential_distribution<> dis(1.15);
+	std::exponential_distribution<> dis(1.0);
 	int random_number = 0;
 	while (true)
 	{
@@ -510,10 +512,7 @@ int main() {
 	auto start = std::chrono::system_clock::now();
 	RequestBuffer buf{ bufSize };
 	RequestAcceptanceSystem acc{ &buf };
-	Family fs[numFamilys]{ {1, &acc}, {2, &acc}, {3, &acc}, {4, &acc}, {5, &acc},
-		{6, &acc}, {7, &acc}, {8, &acc}, {9, &acc}, {10, &acc},
-		{11, &acc}, {12, &acc}, {13, &acc}, {14, &acc}, {15, &acc},
-	};
+	Family fs[numFamilys]{};
 	BanksManageSystem man{};
 	auto beg = man.getEndIt() - numBanks;
 	RequestDistributionSystem dist{ &buf, &man, beg };
@@ -523,6 +522,7 @@ int main() {
 	std::thread tf[numFamilys];
 	for (size_t i = 0; i < numFamilys; i++)
 	{
+		fs[i].setPtr(&acc);
 		tf[i] = std::thread{ &Family::generateAndSendRequest, fs + i };
 	}
 	std::thread t1{ &RequestAcceptanceSystem::run, &acc };
