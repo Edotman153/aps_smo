@@ -11,9 +11,9 @@
 #include <algorithm>
 #include <map>
 #undef min
-constexpr size_t numFamilys = 5;
-constexpr size_t bufSize = 10;
-constexpr size_t numBanks = 4;
+constexpr size_t numFamilys = 15;
+constexpr size_t bufSize = 30;
+constexpr size_t numBanks = 10;
 std::mutex coutMutex{};
 struct stat_t
 {
@@ -89,6 +89,10 @@ public:
 	using data_t = std::vector< const Request* >;
 	using range_t = std::pair< data_t::iterator, data_t::iterator >;
 	using iter_t = data_t::iterator;
+	RequestBuffer(size_t s)
+	{
+		data.reserve(s);
+	}
 	iter_t insertRequest(const Request* r)
 	{
 		mutex.lock();
@@ -208,6 +212,7 @@ public:
 	void run();
 	size_t getid() { return id; }
 	size_t getAvailableTime() { return availableTime; }
+	void setTime(time_type t) { en = t; }
 private:
 	BanksManageSystem* man;
 	size_t id;
@@ -275,7 +280,7 @@ private:
 	std::vector< bool > availables;
 	std::mutex mutex;
 	void triggerDistSys(iter_t bank);
-	
+
 };
 
 class RequestDistributionSystem
@@ -310,7 +315,6 @@ public:
 	{
 		mutex.lock();
 		++numAvailableBanks;
-		toSend = bank;
 		//std::cout << "Added available bank to dist sys\n";
 		mutex.unlock();
 	}
@@ -327,6 +331,12 @@ public:
 			{
 				mutex.lock();
 				auto it = man->chooseBank(toSend);
+				++toSend;
+				auto beg = man->getEndIt() - numBanks;
+				if (toSend == man->getEndIt())
+				{
+					toSend = beg;
+				}
 				auto r = chooseRequest();
 				(*it).addRequest(r);
 				--numAvailableBanks;
@@ -347,6 +357,7 @@ public:
 				}
 				coutMutex.lock();
 				std::cout << "Request " << r->getid() << " add to bank " << it->getid() << '\n';
+				std::cout << "Pointer on next bank " << toSend - beg << '\n';
 				coutMutex.unlock();
 				mutex.unlock();
 			}
@@ -372,21 +383,18 @@ private:
 		size_t minid = -1;//max size_t
 		for (auto it = d.first; it < d.first + numRequestInBuf; ++it)
 		{
-			if (*it != nullptr)
+			size_t prio = (*it)->getFamily()->getPriority();
+			size_t id = (*it)->getid();
+			if (prio > maxPrio)
 			{
-				size_t prio = (*it)->getFamily()->getPriority();
-				size_t id = (*it)->getid();
-				if (prio > maxPrio)
-				{
-					maxPrio = prio;
-					I = it - d.first;
-					minid = id;
-				}
-				if (id < minid)
-				{
-					minid = id;
-					I = it - d.first;
-				}
+				maxPrio = prio;
+				I = it - d.first;
+				minid = id;
+			}
+			if (id < minid)
+			{
+				minid = id;
+				I = it - d.first;
 			}
 		}
 		auto res = buf->extractRequest(d.first + I);
@@ -416,8 +424,6 @@ void Family::generateAndSendRequest()
 	int random_number = 0;
 	while (true)
 	{
-		random_number = dis(gen);
-		Sleep(random_number * 50);
 		mutex.lock();
 		coutMutex.lock();
 		std::cout << "Request " << requestid << " was generated\n";
@@ -425,6 +431,8 @@ void Family::generateAndSendRequest()
 		const Request* req = new Request(this, requestid++);
 		r->acceptRequest(req);
 		mutex.unlock();
+		random_number = dis(gen);
+		Sleep(random_number * 50);
 	}
 }
 
@@ -432,7 +440,7 @@ void Bank::run()
 {
 	std::random_device rd;
 	std::mt19937 gen(rd());
-	std::exponential_distribution<> dis(1.7);
+	std::exponential_distribution<> dis(1.15);
 	int random_number = 0;
 	while (true)
 	{
@@ -442,7 +450,6 @@ void Bank::run()
 			continue;
 		}
 		auto st = std::chrono::system_clock::now();
-		availableTime += (std::chrono::duration_cast<std::chrono::milliseconds>(st - en)).count();
 		random_number = dis(gen) * 100;
 		Sleep(random_number);
 		coutMutex.lock();
@@ -456,6 +463,8 @@ void Bank::run()
 		delete toProceed;
 		toProceed = nullptr;
 		man->toggleAvailable(id);
+		en = std::chrono::system_clock::now();
+		availableTime += (std::chrono::duration_cast<std::chrono::milliseconds>(en - st)).count();
 	}
 }
 
@@ -498,15 +507,18 @@ void RequestAcceptanceSystem::run()
 }
 
 int main() {
-	RequestBuffer buf{};
+	auto start = std::chrono::system_clock::now();
+	RequestBuffer buf{ bufSize };
 	RequestAcceptanceSystem acc{ &buf };
-	Family fs[numFamilys]{ {1, &acc}, {2, &acc}, {3, &acc}, {4, &acc}, {5, &acc} };
+	Family fs[numFamilys]{ {1, &acc}, {2, &acc}, {3, &acc}, {4, &acc}, {5, &acc},
+		{6, &acc}, {7, &acc}, {8, &acc}, {9, &acc}, {10, &acc},
+		{11, &acc}, {12, &acc}, {13, &acc}, {14, &acc}, {15, &acc},
+	};
 	BanksManageSystem man{};
 	auto beg = man.getEndIt() - numBanks;
 	RequestDistributionSystem dist{ &buf, &man, beg };
 	acc.setDistPtr(&dist);
 	man.setDistPtr(&dist);
-	auto start = std::chrono::system_clock::now();
 
 	std::thread tf[numFamilys];
 	for (size_t i = 0; i < numFamilys; i++)
@@ -516,25 +528,27 @@ int main() {
 	std::thread t1{ &RequestAcceptanceSystem::run, &acc };
 	std::thread t2{ &RequestDistributionSystem::run, &dist };
 	std::thread tb[numBanks];
+	auto t = std::chrono::system_clock::now();
 	for (size_t i = 0; i < numBanks; i++)
 	{
-		tb[i] = std::thread{ &Bank::run, &(beg[i])};
+		tb[i] = std::thread{ &Bank::run, &(beg[i]) };
 		dist.addAvailableBank(beg + i);
+		beg[i].setTime(t);
 	}
-	Sleep(10000);
+	Sleep(15000);
 	auto end = std::chrono::system_clock::now();
 	auto allTime = (std::chrono::duration_cast<std::chrono::milliseconds>(end - start)).count();
 	std::ofstream out;
 	out.open("C:\\trash\\aps\\aps_smo\\banks.txt");
 	for (size_t i = 0; i < numBanks; i++)
 	{
-		out << "Bank " << i << ' ' << 1 - (float(beg[i].getAvailableTime()) / allTime) << '\n';
+		out << "Bank " << i << ' ' << (float(beg[i].getAvailableTime()) / allTime) << '\n';
 	}
 	out.close();
 	out.open("C:\\trash\\aps\\aps_smo\\familys.txt");
 	for (size_t i = 0; i < numFamilys; i++) {
 		out << "USER " << i << " statistic: ALL: " << stats[i].allRequests << " success: "
-			<< stats[i].proceededRequests<< " declined: " << stats[i].rejectedRequests << '\n';
+			<< stats[i].proceededRequests << " declined: " << stats[i].rejectedRequests << '\n';
 		out << "waitDurations: ";
 		for (size_t j : stats[i].processTime) {
 			out << j << ' ';
