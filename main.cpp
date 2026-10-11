@@ -1,52 +1,105 @@
-#include <iostream>
+// Имитационная модель системы массового обслуживания (СМО).
+//
+//   источники (Family) -> приём (RequestAcceptanceSystem) -> буфер (RequestBuffer)
+//        -> диспетчер (RequestDistributionSystem) -> приборы (Bank)
+//
+// Каждый компонент работает в своём потоке, время реальное (миллисекунды).
+//
+// Запуск:  smo [каталог_результатов] [секунд] [--quiet]
+//   каталог_результатов  куда записать banks.txt и familys.txt (по умолчанию текущий)
+//   секунд               длительность моделирования (по умолчанию 15)
+//   --quiet, -q          не печатать ход моделирования в консоль
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdlib>
+#include <deque>
+#include <filesystem>
 #include <fstream>
-#include <thread>
+#include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
-#include <string>
-#include <vector>
 #include <random>
-#include <windows.h>
-#include <memory>
-#include <algorithm>
-#include <map>
-#undef min
-constexpr size_t numFamilys = 5;
-constexpr size_t bufSize = 10;
-constexpr size_t numBanks = 7;
-std::mutex coutMutex{};
+#include <string>
+#include <thread>
+#include <vector>
+
+// ---------------------------------------------------------------- параметры модели
+constexpr size_t numFamilys = 5;   // число источников заявок
+constexpr size_t bufSize = 10;     // ёмкость буфера
+constexpr size_t numBanks = 7;     // число приборов
+constexpr int familyStepMs = 50;   // источник создаёт заявку через 1 или 2 шага по 50 мс
+constexpr double meanServiceMs = 100.0;  // обслуживание: экспоненциальное, среднее 100 мс
+
+// ---------------------------------------------------------------- общие вещи
+using clock_type = std::chrono::steady_clock;
+using time_type = clock_type::time_point;
+
+static long long elapsedMs(time_type from, time_type to)
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+}
+
+static std::atomic<bool> running{ true };  // сбрасывается в конце моделирования
+static std::atomic<bool> quiet{ false };
+static std::mutex coutMutex;
+static std::mutex stopMutex;
+static std::condition_variable stopCv;
+
+static void log(const std::string& s)
+{
+	if (quiet)
+	{
+		return;
+	}
+	std::lock_guard<std::mutex> lk(coutMutex);
+	std::cout << s << '\n';
+}
+
+// Пауза, которую можно прервать остановкой моделирования. false - модель остановлена.
+static bool sleepFor(std::chrono::milliseconds d)
+{
+	std::unique_lock<std::mutex> lk(stopMutex);
+	return !stopCv.wait_for(lk, d, [] { return !running.load(); });
+}
+
 struct stat_t
 {
-	size_t allRequests;
-	size_t proceededRequests;
-	size_t rejectedRequests;
-	std::vector< size_t > waitTime;
-	std::vector< size_t > processTime;
+	size_t allRequests = 0;
+	size_t proceededRequests = 0;
+	size_t rejectedRequests = 0;
+	std::vector< size_t > waitTime;     // время от создания заявки до отправки на прибор, мс
+	std::vector< size_t > processTime;  // время от отправки на прибор до конца обслуживания, мс
 };
-std::map< size_t, stat_t > stats;
-std::mutex statsMutex;
-using time_type = std::chrono::system_clock::time_point;
+static std::map< size_t, stat_t > stats;
+static std::mutex statsMutex;
 
+// ---------------------------------------------------------------- заявка и источник
 class Family;
 
 class Request
 {
 public:
-	Request(const Family* f, int id) :
+	Request(const Family* f, size_t id) :
 		f_(f),
 		id_(id),
-		createTime(std::chrono::system_clock::now())
+		createTime(clock_type::now())
 	{}
 	const Family* getFamily() const { return f_; }
 	size_t getid() const { return id_; }
 	time_type getSendTime() const { return sendTime; }
-	void setSendTime(time_type t) const { sendTime = t; }
+	void setSendTime(time_type t) { sendTime = t; }
 	time_type getCreateTime() const { return createTime; }
 private:
 	const Family* f_;
 	size_t id_;
 	time_type createTime;
-	mutable time_type sendTime;
+	time_type sendTime{};
 };
 
 class RequestAcceptanceSystem;
@@ -54,388 +107,308 @@ class RequestAcceptanceSystem;
 class Family
 {
 public:
-	Family() :
-		r(nullptr),
-		priority(0),
-		id(0)
+	Family(size_t id, RequestAcceptanceSystem* acc) :
+		acc_(acc),
+		id_(id),
+		priority_(id)  // приоритет источника равен его номеру
 	{
-		mutex.lock();
-		id = familyid;
-		priority = id;
-		++familyid;
-		mutex.unlock();
-		statsMutex.lock();
-		stats[id];
-		statsMutex.unlock();
+		std::lock_guard<std::mutex> lk(statsMutex);
+		stats[id_];
 	}
 	void generateAndSendRequest();
-	size_t getPriority() const { return priority; }
-	size_t getid() const { return id; }
-	void setPtr(RequestAcceptanceSystem* acc) const { r = acc; }
+	size_t getPriority() const { return priority_; }
+	size_t getid() const { return id_; }
 private:
-	mutable RequestAcceptanceSystem* r;
-	size_t priority;
-	size_t id;
-	static size_t familyid;
-	static size_t requestid;
-	static std::mutex mutex;
+	RequestAcceptanceSystem* acc_;
+	size_t id_;
+	size_t priority_;
+	inline static size_t nextRequestId = 0;
+	inline static std::mutex genMutex{};
 };
 
-size_t Family::familyid = 0;
-size_t Family::requestid = 0;
-std::mutex Family::mutex{};
-
+// ---------------------------------------------------------------- буфер
 class RequestBuffer
 {
 public:
-	using data_t = std::vector< const Request* >;
-	using range_t = std::pair< data_t::iterator, data_t::iterator >;
-	using iter_t = data_t::iterator;
-	RequestBuffer(size_t s)
+	explicit RequestBuffer(size_t cap) : capacity(cap) { data.reserve(cap); }
+	~RequestBuffer()
 	{
-		data.reserve(s);
-	}
-	iter_t insertRequest(const Request* r)
-	{
-		mutex.lock();
-		if (currSize < bufSize)
+		for (Request* r : data)
 		{
-			data.push_back(r);
-			++currSize;
-			auto res = data.end() - 1;
-			coutMutex.lock();
-			std::cout << "Inserted " << r->getid() << '\n';
-			coutMutex.unlock();
-			mutex.unlock();
-			return res;
+			delete r;
+		}
+	}
+	RequestBuffer(const RequestBuffer&) = delete;
+	RequestBuffer& operator=(const RequestBuffer&) = delete;
+
+	// Кладёт заявку в буфер. Если буфер полон, вместо неё вытесняется последняя из лежащих
+	// заявок: она остаётся в роли отказа и возвращается (иначе nullptr).
+	Request* insertOrReplaceLast(Request* r)
+	{
+		std::lock_guard<std::mutex> lk(mutex);
+		print();
+		Request* evicted = nullptr;
+		if (data.size() >= capacity)
+		{
+			evicted = data.back();
+			data.back() = r;
 		}
 		else
 		{
-			auto res = data.end();
-			mutex.unlock();
-			return res;
+			data.push_back(r);
 		}
+		log("Inserted " + std::to_string(r->getid()));
+		print();
+		return evicted;
 	}
-	range_t getData()
+
+	// Достаёт заявку на обслуживание: с наибольшим приоритетом, а при равных приоритетах
+	// самую раннюю. Заявки в буфере лежат в порядке возрастания id, поэтому проверка
+	// id < minid ниже срабатывает только на первой заявке (когда ещё ничего не выбрано).
+	Request* extractBest()
 	{
-		mutex.lock();
-		auto beg = data.begin();
-		auto end = data.end();
-		mutex.unlock();
-		return { beg, end };
-	}
-	const Request* extractRequest(iter_t it)
-	{
-		mutex.lock();
-		auto res = *it;
-		auto r = std::remove(data.begin(), data.begin() + currSize, res);
-		data.erase(r);
-		--currSize;
-		//std::cout << "Extracted " << res->getid() << '\n';
-		mutex.unlock();
+		std::lock_guard<std::mutex> lk(mutex);
+		if (data.empty())
+		{
+			return nullptr;
+		}
+		size_t maxPrio = 0;
+		size_t I = 0;
+		size_t minid = static_cast<size_t>(-1);
+		for (size_t i = 0; i < data.size(); ++i)
+		{
+			size_t prio = data[i]->getFamily()->getPriority();
+			size_t id = data[i]->getid();
+			if (prio > maxPrio)
+			{
+				maxPrio = prio;
+				I = i;
+				minid = id;
+			}
+			if (id < minid)
+			{
+				minid = id;
+				I = i;
+			}
+		}
+		Request* res = data[I];
+		data.erase(data.begin() + I);
+		log("Request " + std::to_string(res->getid()) + " was chosen");
 		return res;
 	}
-	void lock() const { extMutex.lock(); }
-	void unlock() const { extMutex.unlock(); }
-	void print()
-	{
-		coutMutex.lock();
-		std::cout << "RequestBuffer: ";
-		for (size_t i = 0; i < bufSize; i++)
-		{
-			std::cout << (i < currSize ? std::to_string(data[i]->getid()) : "_") << ' ';
-		}
-		std::cout << '\n';
-		coutMutex.unlock();
-	}
-private:
-	data_t data;
-	size_t currSize;
-	mutable std::mutex mutex;
-	mutable std::mutex extMutex;
-};
 
-class RequestDistributionSystem;
-
-class RequestAcceptanceSystem
-{
-public:
-	RequestAcceptanceSystem(RequestBuffer* b) :
-		buf(b)
-	{}
-	void acceptRequest(const Request* r)
-	{
-		mutex.lock();
-		queue.push(r);
-		//std::cout << "Pushed " << r->getid() << '\n';
-		mutex.unlock();
-	}
-	void setDistPtr(RequestDistributionSystem* d) { dist = d; }
-	void run();
 private:
-	RequestBuffer* buf;
-	RequestDistributionSystem* dist;
-	RequestBuffer::iter_t toSend;
-	std::queue< const Request* > queue;
+	std::vector< Request* > data;
+	size_t capacity;
 	std::mutex mutex;
-	void rejectRequest(const Request* rNew)
+
+	void print() // вызывать под mutex
 	{
-		auto data = buf->getData();
-		auto r = buf->extractRequest(toSend);
-		toSend = buf->insertRequest(rNew);
-		coutMutex.lock();
-		std::cout << "Rejected " << r->getid() << '\n';
-		coutMutex.unlock();
-		statsMutex.lock();
-		stats[r->getFamily()->getid()].allRequests++;
-		stats[r->getFamily()->getid()].rejectedRequests++;
-		statsMutex.unlock();
-		delete r;
+		if (quiet)
+		{
+			return;
+		}
+		std::string s = "RequestBuffer: ";
+		for (size_t i = 0; i < capacity; i++)
+		{
+			s += (i < data.size() ? std::to_string(data[i]->getid()) : "_");
+			s += ' ';
+		}
+		log(s);
 	}
 };
 
+// ---------------------------------------------------------------- приборы
+class RequestDistributionSystem;
 class BanksManageSystem;
 
 class Bank
 {
 public:
-	Bank(BanksManageSystem* m, size_t i) :
-		man(m),
-		id(i),
-		toProceed(nullptr),
-		availableTime(0),
-		en(std::chrono::system_clock::now())
-	{}
-	void addRequest(const Request* r)
+	Bank(BanksManageSystem* m, size_t i) : man(m), id(i) {}
+	~Bank() { delete toProceed; }
+	Bank(const Bank&) = delete;
+	Bank& operator=(const Bank&) = delete;
+
+	void addRequest(Request* r)
 	{
-		toProceed = r;
-		//std::cout << "Request " << r->getid() << " sent to bank " << id << '\n';
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			toProceed = r;
+		}
+		cv.notify_one();
+	}
+	void wake()
+	{
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+		}
+		cv.notify_all();
 	}
 	void run();
-	size_t getid() { return id; }
-	size_t getAvailableTime() { return availableTime; }
-	void setTime(time_type t) { en = t; }
+	size_t getid() const { return id; }
+	// Суммарное время обслуживания, мс (читать после остановки потока)
+	size_t getAvailableTime() const { return availableTime; }
 private:
 	BanksManageSystem* man;
 	size_t id;
-	const Request* toProceed;
-	size_t availableTime;
-	std::chrono::system_clock::time_point en;
+	Request* toProceed = nullptr;
+	size_t availableTime = 0;
+	std::mutex mutex;
+	std::condition_variable cv;
 };
 
 class BanksManageSystem
 {
 public:
-	using banks_t = std::vector< Bank >;
-	using iter_t = banks_t::iterator;
+	static constexpr size_t none = static_cast<size_t>(-1);
+
 	BanksManageSystem()
 	{
 		for (size_t i = 0; i < numBanks; i++)
 		{
-			banks.push_back(Bank{ this, i });
-			availables.push_back(true);
+			banks.emplace_back(this, i);
 		}
+		availables.assign(numBanks, true);
 	}
-	iter_t chooseBank(iter_t wantToSend)
+	// Первый свободный прибор, начиная с номера from (по кругу); он помечается занятым.
+	size_t chooseBank(size_t from)
 	{
-		mutex.lock();
-		size_t I = wantToSend - banks.begin();
-		for (size_t i = I; i < numBanks; i++)
+		std::lock_guard<std::mutex> lk(mutex);
+		for (size_t k = 0; k < numBanks; k++)
 		{
+			size_t i = (from + k) % numBanks;
 			if (availables[i])
 			{
-				//std::cout << "Bank " << i << " was chosen\n";
 				availables[i] = false;
-				mutex.unlock();
-				return banks.begin() + i;
+				return i;
 			}
 		}
-		for (size_t i = 0; i < I; i++)
-		{
-			if (availables[i])
-			{
-				//std::cout << "Bank " << i << " was chosen\n";
-				availables[i] = false;
-				mutex.unlock();
-				return banks.begin() + i;
-			}
-		}
-		auto res = banks.end();
-		//std::cout << "Bank wasn't chosen\n";
-		mutex.unlock();
-		return res;
+		return none;
 	}
 	void toggleAvailable(size_t i)
 	{
-		mutex.lock();
-		iter_t bank = banks.begin() + i;
-		availables[i] = true;
-		//std::cout << "Bank " << i << " toggled\n";
-		mutex.unlock();
-		triggerDistSys(bank);
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			availables[i] = true;
+		}
+		triggerDistSys();
 	}
-	iter_t getEndIt() { return banks.end(); }
+	Bank& bank(size_t i) { return banks.at(i); }
 	void setDistPtr(RequestDistributionSystem* d) { dist = d; }
 private:
-	RequestDistributionSystem* dist;
-	banks_t banks;
+	RequestDistributionSystem* dist = nullptr;
+	std::deque< Bank > banks;  // deque: Bank нельзя копировать и переносить
 	std::vector< bool > availables;
 	std::mutex mutex;
-	void triggerDistSys(iter_t bank);
-
+	void triggerDistSys();
 };
 
+// ---------------------------------------------------------------- диспетчер
 class RequestDistributionSystem
 {
 public:
-	RequestDistributionSystem(RequestBuffer* b, BanksManageSystem* m, BanksManageSystem::iter_t send) :
+	RequestDistributionSystem(RequestBuffer* b, BanksManageSystem* m) :
 		buf(b),
-		man(m),
-		toSend(send)
+		man(m)
 	{}
 	void addRequestInBuf()
 	{
-		mutex.lock();
-		++numRequestInBuf;
-		//std::cout << "Added request to dist sys\n";
-		mutex.unlock();
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			++numRequestInBuf;
+		}
+		cv.notify_one();
 	}
-	void delRequestFromBuf()
+	// Заявка вытеснена из буфера (отказ); число заявок в буфере не меняется
+	void registerRejected()
 	{
-		mutex.lock();
-		--numRequestInBuf;
+		std::lock_guard<std::mutex> lk(mutex);
 		++rejectedRequests;
 		++allRequests;
 		if (allRequests % 100 == 0)
 		{
 			print();
 		}
-		//std::cout << "Deleted request from dist sys\n";
-		mutex.unlock();
 	}
-	void addAvailableBank(BanksManageSystem::iter_t bank)
+	void addAvailableBank()
 	{
-		mutex.lock();
-		++numAvailableBanks;
-		//std::cout << "Added available bank to dist sys\n";
-		mutex.unlock();
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			++numAvailableBanks;
+		}
+		cv.notify_one();
+	}
+	void wake()
+	{
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+		}
+		cv.notify_all();
 	}
 	void run()
 	{
+		std::unique_lock<std::mutex> lk(mutex);
 		while (true)
 		{
-			if (!(numRequestInBuf != 0 && numAvailableBanks != 0))
+			cv.wait(lk, [this] { return !running || (numRequestInBuf != 0 && numAvailableBanks != 0); });
+			if (!running)
 			{
-				//Sleep(1);
-				continue;
+				return;
 			}
-			else
+			// Свободный прибор ищем по кругу, начиная с nextBank
+			size_t bankId = man->chooseBank(nextBank);
+			nextBank = (nextBank + 1) % numBanks;
+			Request* r = buf->extractBest();
+			Bank& bank = man->bank(bankId);  // none здесь невозможен: числа в счётчиках согласованы
+			--numAvailableBanks;
+			--numRequestInBuf;
+			++proceededRequests;
+			++allRequests;
+			auto sendT = clock_type::now();
+			r->setSendTime(sendT);
 			{
-				mutex.lock();
-				auto it = man->chooseBank(toSend);
-				++toSend;
-				auto beg = man->getEndIt() - numBanks;
-				if (toSend == man->getEndIt())
-				{
-					toSend = beg;
-				}
-				auto r = chooseRequest();
-				(*it).addRequest(r);
-				--numAvailableBanks;
-				--numRequestInBuf;
-				++proceededRequests;
-				++allRequests;
-				statsMutex.lock();
-				stats[r->getFamily()->getid()].allRequests++;
-				stats[r->getFamily()->getid()].proceededRequests++;
-				auto sendT = std::chrono::system_clock::now();
-				r->setSendTime(sendT);
-				auto t = (std::chrono::duration_cast<std::chrono::milliseconds>(sendT - r->getCreateTime())).count();
-				stats[r->getFamily()->getid()].waitTime.push_back(t);
-				statsMutex.unlock();
-				if (allRequests % 100 == 0)
-				{
-					print();
-				}
-				coutMutex.lock();
-				std::cout << "Request " << r->getid() << " add to bank " << it->getid() << '\n';
-				std::cout << "Pointer on next bank " << toSend - beg << '\n';
-				coutMutex.unlock();
-				mutex.unlock();
+				std::lock_guard<std::mutex> sl(statsMutex);
+				stat_t& st = stats[r->getFamily()->getid()];
+				st.allRequests++;
+				st.proceededRequests++;
+				st.waitTime.push_back(elapsedMs(r->getCreateTime(), sendT));
 			}
-
+			// После addRequest заявкой владеет прибор и может её удалить в любой момент,
+			// поэтому всё нужное из неё берём заранее
+			const size_t requestId = r->getid();
+			bank.addRequest(r);
+			r = nullptr;
+			if (allRequests % 100 == 0)
+			{
+				print();
+			}
+			log("Request " + std::to_string(requestId) + " add to bank " + std::to_string(bank.getid()));
+			log("Pointer on next bank " + std::to_string(nextBank));
 		}
 	}
 private:
 	RequestBuffer* buf;
 	BanksManageSystem* man;
-	BanksManageSystem::iter_t toSend;
-	size_t numRequestInBuf;
-	size_t numAvailableBanks;
+	size_t nextBank = 0;
+	size_t numRequestInBuf = 0;
+	size_t numAvailableBanks = 0;
+	size_t proceededRequests = 0;
+	size_t rejectedRequests = 0;
+	size_t allRequests = 0;
 	std::mutex mutex;
-	size_t proceededRequests;
-	size_t rejectedRequests;
-	size_t allRequests;
-	const Request* chooseRequest()
+	std::condition_variable cv;
+
+	void print() // вызывать под mutex
 	{
-		buf->lock();
-		auto d = buf->getData();
-		size_t maxPrio = 0;
-		size_t I = 0;
-		size_t minid = -1;//max size_t
-		for (auto it = d.first; it < d.first + numRequestInBuf; ++it)
-		{
-			size_t prio = (*it)->getFamily()->getPriority();
-			size_t id = (*it)->getid();
-			if (prio > maxPrio)
-			{
-				maxPrio = prio;
-				I = it - d.first;
-				minid = id;
-			}
-			if (id < minid)
-			{
-				minid = id;
-				I = it - d.first;
-			}
-		}
-		auto res = buf->extractRequest(d.first + I);
-		if (res != nullptr)
-		{
-			coutMutex.lock();
-			std::cout << "Request " << res->getid() << " was chosen\n";
-			coutMutex.unlock();
-		}
-		buf->unlock();
-		return res;
-	}
-	void print()
-	{
-		coutMutex.lock();
-		std::cout << "Statistics: all requests - " << allRequests << " proceeded requests - ";
-		std::cout << proceededRequests << " rejected requests - " << rejectedRequests << '\n';
-		coutMutex.unlock();
+		log("Statistics: all requests - " + std::to_string(allRequests) + " proceeded requests - "
+			+ std::to_string(proceededRequests) + " rejected requests - " + std::to_string(rejectedRequests));
 	}
 };
 
-void Family::generateAndSendRequest()
+void BanksManageSystem::triggerDistSys()
 {
-	std::random_device rd;
-	std::mt19937 gen(rd());
-	std::uniform_int_distribution<> dis(1, 2);
-	int random_number = 0;
-	while (true)
-	{
-		mutex.lock();
-		coutMutex.lock();
-		std::cout << "Request " << requestid << " was generated\n";
-		coutMutex.unlock();
-		const Request* req = new Request(this, requestid++);
-		r->acceptRequest(req);
-		mutex.unlock();
-		random_number = dis(gen);
-		Sleep(random_number * 50);
-	}
+	dist->addAvailableBank();
 }
 
 void Bank::run()
@@ -443,126 +416,256 @@ void Bank::run()
 	std::random_device rd;
 	std::mt19937 gen(rd());
 	std::exponential_distribution<> dis(1.0);
-	int random_number = 0;
 	while (true)
 	{
-		if (toProceed == nullptr)
+		Request* r = nullptr;
 		{
-			//Sleep(1);
-			continue;
+			std::unique_lock<std::mutex> lk(mutex);
+			cv.wait(lk, [this] { return toProceed != nullptr || !running; });
+			if (toProceed == nullptr)
+			{
+				return;  // остановка, а работы нет
+			}
+			r = toProceed;
 		}
-		auto st = std::chrono::system_clock::now();
-		random_number = dis(gen) * 100;
-		Sleep(random_number);
-		coutMutex.lock();
-		std::cout << "Request " << toProceed->getid() << " was proceeded\n";
-		coutMutex.unlock();
-		en = std::chrono::system_clock::now();
-		statsMutex.lock();
-		auto t = (std::chrono::duration_cast<std::chrono::milliseconds>(en - toProceed->getSendTime())).count();
-		stats[toProceed->getFamily()->getid()].processTime.push_back(t);
-		statsMutex.unlock();
-		delete toProceed;
-		toProceed = nullptr;
+		auto st = clock_type::now();
+		int duration = static_cast<int>(dis(gen) * meanServiceMs);
+		bool finished = sleepFor(std::chrono::milliseconds(duration));
+		auto en = clock_type::now();
+		if (finished)
+		{
+			log("Request " + std::to_string(r->getid()) + " was proceeded");
+			std::lock_guard<std::mutex> sl(statsMutex);
+			stats[r->getFamily()->getid()].processTime.push_back(elapsedMs(r->getSendTime(), en));
+		}
+		delete r;
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			toProceed = nullptr;
+		}
+		// Время недообслуженной в момент остановки заявки тоже занимает прибор
+		availableTime += elapsedMs(st, en);
+		if (!finished)
+		{
+			return;
+		}
 		man->toggleAvailable(id);
-		en = std::chrono::system_clock::now();
-		availableTime += (std::chrono::duration_cast<std::chrono::milliseconds>(en - st)).count();
 	}
 }
 
-void BanksManageSystem::triggerDistSys(iter_t bank)
+// ---------------------------------------------------------------- приём заявок
+class RequestAcceptanceSystem
 {
-	dist->addAvailableBank(bank);
-}
+public:
+	explicit RequestAcceptanceSystem(RequestBuffer* b) : buf(b) {}
+	~RequestAcceptanceSystem()
+	{
+		while (!queue.empty())
+		{
+			delete queue.front();
+			queue.pop();
+		}
+	}
+	void acceptRequest(Request* r)
+	{
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+			queue.push(r);
+		}
+		cv.notify_one();
+	}
+	void setDistPtr(RequestDistributionSystem* d) { dist = d; }
+	void wake()
+	{
+		{
+			std::lock_guard<std::mutex> lk(mutex);
+		}
+		cv.notify_all();
+	}
+	void run();
+private:
+	RequestBuffer* buf;
+	RequestDistributionSystem* dist = nullptr;
+	std::queue< Request* > queue;
+	std::mutex mutex;
+	std::condition_variable cv;
+};
 
 void RequestAcceptanceSystem::run()
 {
 	while (true)
 	{
-		if (queue.empty())
+		Request* r = nullptr;
 		{
-			//Sleep(1);
-			continue;
+			std::unique_lock<std::mutex> lk(mutex);
+			cv.wait(lk, [this] { return !queue.empty() || !running; });
+			if (!running)
+			{
+				return;
+			}
+			r = queue.front();
+			queue.pop();
 		}
-		mutex.lock();
-		auto r = queue.front();
-		buf->lock();
-		buf->print();
-		auto it = buf->insertRequest(r);
-		if (it == buf->getData().second)
+		Request* evicted = buf->insertOrReplaceLast(r);
+		if (evicted != nullptr)
 		{
-			rejectRequest(r);
-			buf->print();
-			buf->unlock();
-			dist->delRequestFromBuf();
+			log("Rejected " + std::to_string(evicted->getid()));
+			{
+				std::lock_guard<std::mutex> sl(statsMutex);
+				stat_t& st = stats[evicted->getFamily()->getid()];
+				st.allRequests++;
+				st.rejectedRequests++;
+			}
+			delete evicted;
+			dist->registerRejected();
 		}
 		else
 		{
-			toSend = it;
-			buf->print();
-			buf->unlock();
+			dist->addRequestInBuf();
 		}
-		dist->addRequestInBuf();
-		queue.pop();
-		mutex.unlock();
 	}
 }
 
-int main() {
-	auto start = std::chrono::system_clock::now();
+void Family::generateAndSendRequest()
+{
+	std::random_device rd;
+	std::mt19937 gen(rd());
+	std::uniform_int_distribution<> dis(1, 2);
+	while (running)
+	{
+		{
+			std::lock_guard<std::mutex> lk(genMutex);
+			log("Request " + std::to_string(nextRequestId) + " was generated");
+			acc_->acceptRequest(new Request(this, nextRequestId++));
+		}
+		if (!sleepFor(std::chrono::milliseconds(dis(gen) * familyStepMs)))
+		{
+			return;
+		}
+	}
+}
+
+// ---------------------------------------------------------------- запуск
+int main(int argc, char** argv)
+{
+	std::filesystem::path outDir = ".";
+	double seconds = 15;
+	int positional = 0;
+	for (int i = 1; i < argc; i++)
+	{
+		std::string a = argv[i];
+		if (a == "--quiet" || a == "-q")
+		{
+			quiet = true;
+		}
+		else if (positional == 0)
+		{
+			outDir = a;
+			positional++;
+		}
+		else if (positional == 1)
+		{
+			char* end = nullptr;
+			seconds = std::strtod(a.c_str(), &end);
+			if (end == a.c_str() || *end != '\0' || seconds <= 0)
+			{
+				std::cerr << "Некорректное число секунд: " << a << '\n';
+				return 1;
+			}
+			positional++;
+		}
+		else
+		{
+			std::cerr << "Использование: " << argv[0] << " [каталог_результатов] [секунд] [--quiet]\n";
+			return 1;
+		}
+	}
+	std::error_code ec;
+	std::filesystem::create_directories(outDir, ec);
+	std::ofstream banksOut(outDir / "banks.txt");
+	std::ofstream familysOut(outDir / "familys.txt");
+	if (!banksOut || !familysOut)
+	{
+		std::cerr << "Не удаётся записать результаты в каталог " << outDir << '\n';
+		return 1;
+	}
+
+	auto start = clock_type::now();
 	RequestBuffer buf{ bufSize };
 	RequestAcceptanceSystem acc{ &buf };
-	Family fs[numFamilys]{};
 	BanksManageSystem man{};
-	auto beg = man.getEndIt() - numBanks;
-	RequestDistributionSystem dist{ &buf, &man, beg };
+	RequestDistributionSystem dist{ &buf, &man };
 	acc.setDistPtr(&dist);
 	man.setDistPtr(&dist);
 
-	std::thread tf[numFamilys];
+	std::vector< std::unique_ptr< Family > > fs;
 	for (size_t i = 0; i < numFamilys; i++)
 	{
-		fs[i].setPtr(&acc);
-		tf[i] = std::thread{ &Family::generateAndSendRequest, fs + i };
+		fs.push_back(std::make_unique< Family >(i, &acc));
 	}
-	std::thread t1{ &RequestAcceptanceSystem::run, &acc };
-	std::thread t2{ &RequestDistributionSystem::run, &dist };
-	std::thread tb[numBanks];
-	auto t = std::chrono::system_clock::now();
 	for (size_t i = 0; i < numBanks; i++)
 	{
-		tb[i] = std::thread{ &Bank::run, &(beg[i]) };
-		dist.addAvailableBank(beg + i);
-		beg[i].setTime(t);
+		dist.addAvailableBank();
 	}
-	Sleep(15000);
-	auto end = std::chrono::system_clock::now();
-	auto allTime = (std::chrono::duration_cast<std::chrono::milliseconds>(end - start)).count();
-	std::ofstream out;
-	out.open("C:\\trash\\aps\\aps_smo\\banks.txt");
-	for (size_t i = 0; i < numBanks; i++)
-	{
-		out << "Bank " << i << ' ' << (float(beg[i].getAvailableTime()) / allTime) << '\n';
-	}
-	out.close();
-	out.open("C:\\trash\\aps\\aps_smo\\familys.txt");
-	for (size_t i = 0; i < numFamilys; i++) {
-		out << "USER " << i << " statistic: ALL: " << stats[i].allRequests << " success: "
-			<< stats[i].proceededRequests << " declined: " << stats[i].rejectedRequests << '\n';
-		out << "waitDurations: ";
-		for (size_t j : stats[i].processTime) {
-			out << j << ' ';
-		}
-		out << '\n' << "Processing durations: ";
-		for (size_t j : stats[i].waitTime) {
-			out << j << ' ';
-		}
-		out << '\n';
-	}
-	out.close();
-	statsMutex.lock();
 
-	statsMutex.unlock();
-	t1.join();
+	std::vector< std::thread > threads;
+	for (auto& f : fs)
+	{
+		threads.emplace_back(&Family::generateAndSendRequest, f.get());
+	}
+	threads.emplace_back(&RequestAcceptanceSystem::run, &acc);
+	threads.emplace_back(&RequestDistributionSystem::run, &dist);
+	for (size_t i = 0; i < numBanks; i++)
+	{
+		threads.emplace_back(&Bank::run, &man.bank(i));
+	}
+
+	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+	auto end = clock_type::now();
+	auto allTime = elapsedMs(start, end);
+
+	// остановка: сбросить флаг, разбудить всех, дождаться потоков
+	{
+		std::lock_guard<std::mutex> lk(stopMutex);
+		running = false;
+	}
+	stopCv.notify_all();
+	acc.wake();
+	dist.wake();
+	for (size_t i = 0; i < numBanks; i++)
+	{
+		man.bank(i).wake();
+	}
+	for (auto& t : threads)
+	{
+		t.join();
+	}
+
+	for (size_t i = 0; i < numBanks; i++)
+	{
+		banksOut << "Bank " << i << ' ' << (double(man.bank(i).getAvailableTime()) / allTime) << '\n';
+	}
+	for (size_t i = 0; i < numFamilys; i++)
+	{
+		const stat_t& st = stats[i];
+		familysOut << "USER " << i << " statistic: ALL: " << st.allRequests << " success: "
+			<< st.proceededRequests << " declined: " << st.rejectedRequests << '\n';
+		familysOut << "waitDurations: ";
+		for (size_t j : st.waitTime)
+		{
+			familysOut << j << ' ';
+		}
+		familysOut << '\n' << "Processing durations: ";
+		for (size_t j : st.processTime)
+		{
+			familysOut << j << ' ';
+		}
+		familysOut << '\n';
+	}
+	if (!banksOut.flush() || !familysOut.flush())
+	{
+		std::cerr << "Ошибка записи результатов\n";
+		return 1;
+	}
 	return 0;
 }

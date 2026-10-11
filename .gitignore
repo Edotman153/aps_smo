@@ -1,0 +1,8 @@
+build/
+out/
+banks.txt
+familys.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
